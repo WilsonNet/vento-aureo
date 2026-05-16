@@ -6,19 +6,22 @@ class Bullet extends Phaser.Physics.Arcade.Sprite {
     super(scene, x, y, 'fireball')
   }
 
+  private ownerId = '?'
+
+  setOwner(id: string) {
+    this.ownerId = id
+  }
+
   fire(x: number, y: number, angle: number) {
-    console.log('Bullet -> fire -> angle', angle)
-    this.body!.reset(x, y)
-    this.setActive(true)
-    this.setVisible(true)
+    console.log(`Bullet [${this.ownerId}] -> fire -> angle ${angle.toFixed(3)}`)
+    this.enableBody(true, x, y, true, true)
     this.scene.physics.velocityFromRotation(angle, 600, this.body!.velocity)
   }
 
   preUpdate(time: number, delta: number) {
     super.preUpdate(time, delta)
     if (this.y <= -32) {
-      this.setActive(false)
-      this.setVisible(false)
+      this.disableBody(true, true)
     }
   }
 }
@@ -35,9 +38,21 @@ export default class Bullets extends Phaser.Physics.Arcade.Group {
     })
   }
 
+  private groupOwner = '?'
+
+  setOwner(id: string) {
+    this.groupOwner = id
+    this.getChildren().forEach((b) => {
+      ;(b as Bullet).setOwner(id)
+    })
+  }
+
   fireBullet(x: number, y: number, angle: number) {
-    const bullet = this.getFirstDead(false)
-    bullet?.fire(x, y, angle)
-    EventBus.emit('bullet-fired')
+    const bullet = this.getFirstDead(false) as Bullet | null
+    if (bullet) {
+      bullet.setOwner(this.groupOwner)
+      bullet.fire(x, y, angle)
+      EventBus.emit('bullet-fired')
+    }
   }
 }

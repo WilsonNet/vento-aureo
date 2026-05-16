@@ -1,6 +1,7 @@
 import Phaser from 'phaser'
 import Bullets from '../skills/Bullets'
 import Melee from '../weapons/Melee'
+import { AIOutput } from './EnemyBrain'
 
 import {
   FacingState,
@@ -19,19 +20,15 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
   private movementState = MovementState.NATURAL
   private stateTimer = 0
   private stanceState = StanceState.RANGED
-  private bullets!: Bullets
+  public bullets!: Bullets
   private mouseAngle = 0
   private actionState = ActionState.NATURAL
   private melee?: Melee
-  private _hp = 100
-
-  public get hp() {
-    return this._hp
-  }
-
-  public set hp(value) {
-    this._hp = value
-  }
+  hp = 100
+  lastFacingDirection = 1
+  private aiOverrideInput: AIOutput | null = null
+  private lastAttackTime = 0
+  private attackCooldown = 1000
 
   constructor(
     scene: Phaser.Scene,
@@ -47,6 +44,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     this.setBounce(0.4)
     this.setCollideWorldBounds(true)
     this.bullets = new Bullets(scene)
+    this.bullets.setOwner('PLAYER')
   }
 
   checkDoubleEligibility(
@@ -73,9 +71,37 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     return canDouble
   }
 
+  takeDamage(amount: number) {
+    this.hp -= amount
+  }
+
+  setAIOverride(input: AIOutput | null) {
+    this.aiOverrideInput = input
+  }
+
+  performAIAttack(angle: number) {
+    this.mouseAngle = angle
+    if (this.stanceState === StanceState.RANGED) {
+      this.bullets.fireBullet(this.body!.x, this.body!.y, angle)
+    } else {
+      this.meleeAttack(this.scene)
+    }
+  }
+
   meleeAttack(scene: Phaser.Scene) {
     const facing = this.decideFacing()
     this.melee = new Melee(scene, facing, this.x, this.y)
+  }
+
+  getMouseAngle() {
+    return this.mouseAngle
+  }
+
+  getFacingDirection(): number {
+    const key = this.anims.currentAnim?.key
+    const dir = key === 'left' ? -1 : 1
+    this.lastFacingDirection = dir
+    return dir
   }
 
   setMouseAngle(angle: number) {
@@ -83,9 +109,12 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
   }
 
   machineAttack(pointer: Phaser.Input.Pointer, scene: Phaser.Scene) {
+    const now = scene.game.loop.time
+    if (now - this.lastAttackTime < this.attackCooldown) return
     switch (this.stanceState) {
       case StanceState.MELEE:
         if (pointer.leftButtonDown()) {
+          this.lastAttackTime = now
           this.meleeAttack(scene)
         } else if (pointer.rightButtonDown()) {
           this.actionState = ActionState.BLOCKING
@@ -96,6 +125,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
         }
         break
       case StanceState.RANGED:
+        this.lastAttackTime = now
         this.bullets.fireBullet(this.body!.x, this.body!.y, this.mouseAngle)
         break
     }
@@ -178,8 +208,41 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     this.setVelocityX(0)
   }
 
+  private updateAI(t: number, dt: number) {
+    const input = this.aiOverrideInput!
+    this.melee?.updatePosition(this.x, this.y)
+    if (this.movementState !== MovementState.NATURAL) return
+    this.actionState = ActionState.NATURAL
+    const sideRun = 160
+    if (input.switchToMelee) {
+      this.stanceState = StanceState.MELEE
+    } else if (input.switchToRanged) {
+      this.stanceState = StanceState.RANGED
+    }
+    if (input.moveLeft) {
+      this.setVelocityX(-sideRun)
+      this.anims.play('left', true)
+    } else if (input.moveRight) {
+      this.setVelocityX(sideRun)
+      this.anims.play('right', true)
+    } else {
+      this.decideIdle()
+    }
+    if (input.jump) {
+      this.handleJump()
+    }
+    if (input.attack && this.scene.game.loop.time - this.lastAttackTime > this.attackCooldown) {
+      this.lastAttackTime = this.scene.game.loop.time
+      this.performAIAttack(input.aimAngle)
+    }
+  }
+
   update(t: number, dt: number, cursors: Record<string, Phaser.Input.Keyboard.Key>) {
     this.melee?.updatePosition(this.x, this.y)
+    if (this.aiOverrideInput) {
+      this.updateAI(t, dt)
+      return
+    }
     if (this.movementState !== MovementState.NATURAL) return
     const sideRun = 160
     if (!cursors?.right?.isDown && cursors?.left?.isDown) {
