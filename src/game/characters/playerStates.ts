@@ -1,24 +1,23 @@
-
 export enum StanceState {
-  MELEE,
-  RANGED
+	MELEE,
+	RANGED,
 }
 
 export enum MovementState {
-  NATURAL,
-  DASHING_RIGHT,
-  DASHING_LEFT,
-  WALL_JUMPING_LEFT,
-  WALL_JUMPING_RIGHT,
-  BLOCKING
+	NATURAL,
+	DASHING_RIGHT,
+	DASHING_LEFT,
+	WALL_JUMPING_LEFT,
+	WALL_JUMPING_RIGHT,
+	BLOCKING,
 }
 
 export enum ActionState {
-  NATURAL,
-  BLOCKING
+	NATURAL,
+	BLOCKING,
 }
 
 export enum FacingState {
-  LEFT,
-  RIGHT
+	LEFT,
+	RIGHT,
 }
