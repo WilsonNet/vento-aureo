@@ -1,9 +1,9 @@
 import Phaser from 'phaser'
-import { FacingState } from '~/characters/playerStates'
+import { FacingState } from '../characters/playerStates'
 
 export default class Melee extends Phaser.GameObjects.Sprite {
   private existanceCounter = 0
-  private xModifier
+  private xModifier: number
   private yModifier = 0
 
   constructor(
@@ -26,12 +26,9 @@ export default class Melee extends Phaser.GameObjects.Sprite {
     scene.add.existing(this)
   }
 
-  fire(x: number, y: number, angle: number) {
-    console.log('Bullet -> fire -> angle', angle)
-    // this.body.reset(x, y)
+  fire() {
     this.setActive(true)
     this.setVisible(true)
-    // this.scene.physics.velocityFromRotation(angle, 600, this.body.velocity)
   }
 
   preUpdate(t: number, dt: number) {

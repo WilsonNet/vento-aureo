@@ -1,6 +1,6 @@
 import Phaser from 'phaser'
 import Bullets from '../skills/Bullets'
-import Melee from '~/weapons/Melee'
+import Melee from '../weapons/Melee'
 
 import {
   FacingState,
@@ -9,8 +9,13 @@ import {
   StanceState,
 } from './playerStates'
 
+interface DoublePressEntry {
+  lastTime: number
+  canDouble: boolean
+}
+
 export default class Player extends Phaser.Physics.Arcade.Sprite {
-  private doublePressEligibility = {}
+  private doublePressEligibility: Record<number, DoublePressEntry> = {}
   private movementState = MovementState.NATURAL
   private stateTimer = 0
   private stanceState = StanceState.RANGED
@@ -33,59 +38,48 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     x: number,
     y: number,
     texture: string,
-    frame?: string | number,
-    enemies: Player[]
+    frame?: string | number
   ) {
     super(scene, x, y, texture, frame)
     scene.physics.add.existing(this)
     scene.sys.displayList.add(this)
     scene.sys.updateList.add(this)
-    scene.input.mouse.disableContextMenu()
     this.setBounce(0.4)
     this.setCollideWorldBounds(true)
-
-    scene.input.on('pointermove', (pointer) => {
-      if (!this) return
-      const playerVector = new Phaser.Math.Vector2(this.x, this.y)
-      this.mouseAngle = Phaser.Math.Angle.BetweenPoints(playerVector, pointer)
-    })
-    this.bullets = new Bullets(scene, enemies)
-
-    scene.input.on('pointerdown', (pointer) =>
-      this.machineAttack(pointer, scene)
-    )
-    scene.input.on('pointerup', (pointer) => this.machineAttack(pointer, scene))
+    this.bullets = new Bullets(scene)
   }
 
   checkDoubleEligibility(
     key: Phaser.Input.Keyboard.Key,
-    eligibilityState: Object,
+    eligibilityState: Record<number, DoublePressEntry>,
     time: number
   ) {
-    //Variable declarations
     const { keyCode } = key
     const lastTime = eligibilityState[keyCode]?.lastTime ?? 0
     const currentTime = time
     const isJustPressed = Phaser.Input.Keyboard.JustDown(key)
     const deltaTime = currentTime - lastTime
-    let canDouble = eligibilityState[keyCode]?.canDouble ?? false
-    //Logic
+    const eligibility = eligibilityState[keyCode]
+    let canDouble = eligibility?.canDouble ?? false
     isJustPressed && canDouble && deltaTime < 200
       ? (canDouble = true)
       : (canDouble = false)
     if (canDouble)
       console.table({ hayai: '早い', deltaTime, currentTime, lastTime })
-    //State update
     eligibilityState[keyCode] = {
-      canDouble: !canDouble, // Can't double if doubled
+      canDouble: !canDouble,
       lastTime: currentTime,
     }
-    // Return
     return canDouble
   }
+
   meleeAttack(scene: Phaser.Scene) {
     const facing = this.decideFacing()
     this.melee = new Melee(scene, facing, this.x, this.y)
+  }
+
+  setMouseAngle(angle: number) {
+    this.mouseAngle = angle
   }
 
   machineAttack(pointer: Phaser.Input.Pointer, scene: Phaser.Scene) {
@@ -95,24 +89,19 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
           this.meleeAttack(scene)
         } else if (pointer.rightButtonDown()) {
           this.actionState = ActionState.BLOCKING
-          // TODO Add Block
           console.count('Blocking')
-        } else if (
-          pointer.rightButtonReleased() //q &&
-          // this.actionState === ActionState.BLOCKING
-        ) {
-          // TODO Add unblocking
+        } else if (pointer.rightButtonReleased()) {
           console.count('Unblocking')
           this.actionState = ActionState.NATURAL
         }
         break
       case StanceState.RANGED:
-        this.bullets.fireBullet(this.body.x, this.body.y, this.mouseAngle)
+        this.bullets.fireBullet(this.body!.x, this.body!.y, this.mouseAngle)
         break
     }
   }
 
-  preUpdate(t, dt) {
+  preUpdate(t: number, dt: number) {
     super.preUpdate(t, dt)
 
     if (this.movementState !== MovementState.NATURAL) this.stateTimer += dt
@@ -152,7 +141,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     switch (this.actionState) {
       case ActionState.BLOCKING:
         if (
-          this.body.touching.down ||
+          this.body?.touching.down ||
           this.movementState === MovementState.NATURAL
         ) {
           this.setVelocityX(0)
@@ -170,8 +159,8 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
   }
 
   decideFacing = () => {
-    const currentKey = this.anims.getCurrentKey()?.split('-')
-    const direction = currentKey?.[0]
+    const currentKey = this.anims.currentAnim?.key
+    const direction = currentKey?.split('-')[0]
     if (direction === 'left') {
       return FacingState.LEFT
     } else {
@@ -189,15 +178,14 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     this.setVelocityX(0)
   }
 
-  update(t: number, dt: number, cursors) {
+  update(t: number, dt: number, cursors: Record<string, Phaser.Input.Keyboard.Key>) {
     this.melee?.updatePosition(this.x, this.y)
     if (this.movementState !== MovementState.NATURAL) return
-    // Esquerda
     const sideRun = 160
     if (!cursors?.right?.isDown && cursors?.left?.isDown) {
       if (
         this.checkDoubleEligibility(
-          cursors.left as Phaser.Input.Keyboard.Key,
+          cursors.left,
           this.doublePressEligibility,
           t
         )
@@ -210,7 +198,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
     } else if (cursors?.right?.isDown && !cursors?.left?.isDown) {
       if (
         this.checkDoubleEligibility(
-          cursors.right as Phaser.Input.Keyboard.Key,
+          cursors.right,
           this.doublePressEligibility,
           t
         )
@@ -236,11 +224,11 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
   }
 
   handleJump() {
-    if (this.body.touching.down) {
+    if (this.body?.touching.down) {
       this.setVelocityY(-330)
-    } else if (this.body.touching.right) {
+    } else if (this.body?.touching.right) {
       this.movementState = MovementState.WALL_JUMPING_LEFT
-    } else if (this.body.touching.left) {
+    } else if (this.body?.touching.left) {
       this.movementState = MovementState.WALL_JUMPING_RIGHT
     }
   }
