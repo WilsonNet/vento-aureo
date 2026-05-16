@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import { ATTACK_COOLDOWN } from "../constants";
+import { BULLET_SPEED } from "../simulation/Physics";
 import Bullets from "../skills/Bullets";
 import Melee from "../weapons/Melee";
 import type { AIOutput } from "./EnemyBrain";
@@ -16,9 +17,9 @@ interface DoublePressEntry {
 	canDouble: boolean;
 }
 
-export default class Player extends Phaser.Physics.Arcade.Sprite {
+export default class Player extends Phaser.GameObjects.Sprite {
 	private doublePressEligibility: Record<number, DoublePressEntry> = {};
-	private movementState = MovementState.NATURAL;
+	movementState = MovementState.NATURAL;
 	private stateTimer = 0;
 	private stanceState = StanceState.RANGED;
 	public bullets!: Bullets;
@@ -28,8 +29,9 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 	hp = 100;
 	lastFacingDirection = 1;
 	private aiOverrideInput: AIOutput | null = null;
-	private lastAttackTime = 0;
+	lastAttackTime = 0;
 	private attackCooldown = ATTACK_COOLDOWN;
+	grounded = false;
 
 	constructor(
 		scene: Phaser.Scene,
@@ -39,11 +41,8 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 		frame?: string | number,
 	) {
 		super(scene, x, y, texture, frame);
-		scene.physics.add.existing(this);
 		scene.sys.displayList.add(this);
 		scene.sys.updateList.add(this);
-		this.setBounce(0.4);
-		this.setCollideWorldBounds(true);
 		this.bullets = new Bullets(scene);
 		this.bullets.setOwner("PLAYER");
 	}
@@ -65,8 +64,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 		} else {
 			canDouble = false;
 		}
-		if (canDouble)
-			console.table({ hayai: "早い", deltaTime, currentTime, lastTime });
+		if (canDouble) console.table({ hayai: "早い", deltaTime, currentTime, lastTime });
 		eligibilityState[keyCode] = {
 			canDouble: !canDouble,
 			lastTime: currentTime,
@@ -85,7 +83,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 	performAIAttack(angle: number) {
 		this.mouseAngle = angle;
 		if (this.stanceState === StanceState.RANGED) {
-			this.bullets.fireBullet(this.body!.x, this.body!.y, angle);
+			this.bullets.fireBullet(this.x, this.y, angle);
 		} else {
 			this.meleeAttack(this.scene);
 		}
@@ -129,7 +127,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 				break;
 			case StanceState.RANGED:
 				this.lastAttackTime = now;
-				this.bullets.fireBullet(this.body!.x, this.body!.y, this.mouseAngle);
+				this.bullets.fireBullet(this.x, this.y, this.mouseAngle);
 				break;
 		}
 	}
@@ -140,30 +138,16 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 		if (this.movementState !== MovementState.NATURAL) this.stateTimer += dt;
 
 		const dashSpeed = 1000;
-		const wallJumpHorizontal = 100;
-		const wallJumpHeight = -100;
 
 		switch (this.movementState) {
 			case MovementState.DASHING_LEFT:
-				this.setVelocityX(-dashSpeed);
+				this.x -= dashSpeed * (dt / 1000);
 				if (this.stateTimer >= 250) this.cleanMovementState();
 				break;
 
 			case MovementState.DASHING_RIGHT:
-				this.setVelocityX(dashSpeed);
+				this.x += dashSpeed * (dt / 1000);
 				if (this.stateTimer >= 250) this.cleanMovementState();
-				break;
-
-			case MovementState.WALL_JUMPING_LEFT:
-				this.setVelocity(-wallJumpHorizontal, wallJumpHeight);
-				this.stateTimer += dt;
-				if (this.stateTimer >= 700) this.cleanMovementState();
-				break;
-
-			case MovementState.WALL_JUMPING_RIGHT:
-				this.setVelocity(wallJumpHorizontal, wallJumpHeight);
-				this.stateTimer += dt;
-				if (this.stateTimer >= 700) this.cleanMovementState();
 				break;
 
 			default:
@@ -173,11 +157,7 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 
 		switch (this.actionState) {
 			case ActionState.BLOCKING:
-				if (
-					this.body?.touching.down ||
-					this.movementState === MovementState.NATURAL
-				) {
-					this.setVelocityX(0);
+				if (this.grounded || this.movementState === MovementState.NATURAL) {
 				}
 				this.anims.play("idle");
 				break;
@@ -196,9 +176,8 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 		const direction = currentKey?.split("-")[0];
 		if (direction === "left") {
 			return FacingState.LEFT;
-		} else {
-			return FacingState.RIGHT;
 		}
+		return FacingState.RIGHT;
 	};
 
 	decideIdle() {
@@ -207,39 +186,6 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 			this.anims.play("left");
 		} else {
 			this.anims.play("right");
-		}
-		this.setVelocityX(0);
-	}
-
-	private updateAI(t: number, dt: number) {
-		const input = this.aiOverrideInput!;
-		this.melee?.updatePosition(this.x, this.y);
-		if (this.movementState !== MovementState.NATURAL) return;
-		this.actionState = ActionState.NATURAL;
-		const sideRun = 160;
-		if (input.switchToMelee) {
-			this.stanceState = StanceState.MELEE;
-		} else if (input.switchToRanged) {
-			this.stanceState = StanceState.RANGED;
-		}
-		if (input.moveLeft) {
-			this.setVelocityX(-sideRun);
-			this.anims.play("left", true);
-		} else if (input.moveRight) {
-			this.setVelocityX(sideRun);
-			this.anims.play("right", true);
-		} else {
-			this.decideIdle();
-		}
-		if (input.jump) {
-			this.handleJump();
-		}
-		if (
-			input.attack &&
-			this.scene.game.loop.time - this.lastAttackTime > this.attackCooldown
-		) {
-			this.lastAttackTime = this.scene.game.loop.time;
-			this.performAIAttack(input.aimAngle);
 		}
 	}
 
@@ -254,7 +200,6 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 			return;
 		}
 		if (this.movementState !== MovementState.NATURAL) return;
-		const sideRun = 160;
 		if (!cursors?.right?.isDown && cursors?.left?.isDown) {
 			if (
 				this.checkDoubleEligibility(
@@ -264,8 +209,6 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 				)
 			) {
 				this.movementState = MovementState.DASHING_LEFT;
-			} else {
-				this.setVelocityX(-sideRun);
 			}
 			this.anims.play("left", true);
 		} else if (cursors?.right?.isDown && !cursors?.left?.isDown) {
@@ -277,15 +220,10 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 				)
 			) {
 				this.movementState = MovementState.DASHING_RIGHT;
-			} else {
-				this.setVelocityX(sideRun);
 			}
 			this.anims.play("right", true);
 		} else {
 			this.decideIdle();
-		}
-		if (cursors?.up?.isDown) {
-			this.handleJump();
 		}
 		if (Phaser.Input.Keyboard.JustDown(cursors.switchMelee)) {
 			this.stanceState = StanceState.MELEE;
@@ -296,13 +234,29 @@ export default class Player extends Phaser.Physics.Arcade.Sprite {
 		}
 	}
 
-	handleJump() {
-		if (this.body?.touching.down) {
-			this.setVelocityY(-330);
-		} else if (this.body?.touching.right) {
-			this.movementState = MovementState.WALL_JUMPING_LEFT;
-		} else if (this.body?.touching.left) {
-			this.movementState = MovementState.WALL_JUMPING_RIGHT;
+	private updateAI(t: number, dt: number) {
+		const input = this.aiOverrideInput!;
+		this.melee?.updatePosition(this.x, this.y);
+		if (this.movementState !== MovementState.NATURAL) return;
+		this.actionState = ActionState.NATURAL;
+		if (input.switchToMelee) {
+			this.stanceState = StanceState.MELEE;
+		} else if (input.switchToRanged) {
+			this.stanceState = StanceState.RANGED;
+		}
+		if (input.moveLeft) {
+			this.anims.play("left", true);
+		} else if (input.moveRight) {
+			this.anims.play("right", true);
+		} else {
+			this.decideIdle();
+		}
+		if (
+			input.attack &&
+			this.scene.game.loop.time - this.lastAttackTime > this.attackCooldown
+		) {
+			this.lastAttackTime = this.scene.game.loop.time;
+			this.performAIAttack(input.aimAngle);
 		}
 	}
 }

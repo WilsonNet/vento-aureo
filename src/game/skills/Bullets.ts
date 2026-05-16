@@ -1,60 +1,63 @@
 import Phaser from "phaser";
+import { BULLET_SPEED } from "../simulation/Physics";
 import { EventBus } from "../EventBus";
 
-class Bullet extends Phaser.Physics.Arcade.Sprite {
-	constructor(scene: Phaser.Scene, x: number, y: number) {
-		super(scene, x, y, "fireball");
-	}
-
-	private ownerId = "?";
-
-	setOwner(id: string) {
-		this.ownerId = id;
-	}
-
-	fire(x: number, y: number, angle: number) {
-		console.log(
-			`Bullet [${this.ownerId}] -> fire -> angle ${angle.toFixed(3)}`,
-		);
-		this.enableBody(true, x, y, true, true);
-		this.scene.physics.velocityFromRotation(angle, 600, this.body!.velocity);
-	}
-
-	preUpdate(time: number, delta: number) {
-		super.preUpdate(time, delta);
-		if (this.y <= -32) {
-			this.disableBody(true, true);
-		}
-	}
+export interface BulletData {
+	sprite: Phaser.GameObjects.Sprite;
+	vx: number;
+	vy: number;
+	active: boolean;
+	ownerId: string;
 }
 
-export default class Bullets extends Phaser.Physics.Arcade.Group {
+export default class Bullets {
+	private pool: BulletData[] = [];
+	private scene: Phaser.Scene;
+	private nextId = 0;
+
 	constructor(scene: Phaser.Scene) {
-		super(scene.physics.world, scene);
-		this.createMultiple({
-			frameQuantity: 900,
-			key: "bullet",
-			active: false,
-			visible: false,
-			classType: Bullet,
-		});
+		this.scene = scene;
 	}
 
-	private groupOwner = "?";
+	setOwner(_id: string) {}
 
-	setOwner(id: string) {
-		this.groupOwner = id;
-		this.getChildren().forEach((b) => {
-			(b as Bullet).setOwner(id);
-		});
+	fireBullet(x: number, y: number, angle: number): BulletData | null {
+		let data = this.pool.find((b) => !b.active);
+		if (!data) {
+			const sprite = this.scene.add.sprite(0, 0, "fireball");
+			sprite.setOrigin(0.5);
+			sprite.setVisible(false);
+			data = {
+				sprite,
+				vx: 0,
+				vy: 0,
+				active: false,
+				ownerId: "",
+			};
+			this.pool.push(data);
+		}
+		data.sprite.setPosition(x, y);
+		data.sprite.setVisible(true);
+		data.vx = Math.cos(angle) * BULLET_SPEED;
+		data.vy = Math.sin(angle) * BULLET_SPEED;
+		data.active = true;
+		data.ownerId = "local";
+		EventBus.emit("bullet-fired");
+		return data;
 	}
 
-	fireBullet(x: number, y: number, angle: number) {
-		const bullet = this.getFirstDead(false) as Bullet | null;
-		if (bullet) {
-			bullet.setOwner(this.groupOwner);
-			bullet.fire(x, y, angle);
-			EventBus.emit("bullet-fired");
+	getActive(): BulletData[] {
+		return this.pool.filter((b) => b.active);
+	}
+
+	getAll(): BulletData[] {
+		return this.pool;
+	}
+
+	deactivateAll() {
+		for (const b of this.pool) {
+			b.active = false;
+			b.sprite.setVisible(false);
 		}
 	}
 }

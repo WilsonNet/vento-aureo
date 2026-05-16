@@ -1,22 +1,25 @@
 import Phaser from "phaser";
-import { ATTACK_COOLDOWN } from "../constants";
 import { EventBus } from "../EventBus";
 import Bullets from "../skills/Bullets";
 import Melee from "../weapons/Melee";
 import { type AIConfig, DEFAULT_AI_CONFIG } from "./AIConfig";
-import EnemyBrain from "./EnemyBrain";
+import EnemyBrain, { type AIOutput } from "./EnemyBrain";
 import { FacingState } from "./playerStates";
 
-export default class AIEnemy extends Phaser.Physics.Arcade.Sprite {
+export default class AIEnemy extends Phaser.GameObjects.Sprite {
 	public bullets: Bullets;
 	private brain: EnemyBrain;
 	private melee?: Melee;
 	private _hp = 100;
 	lastFacingDirection = 1;
-	private lastAttackTime = 0;
-	private attackCooldown = ATTACK_COOLDOWN;
+	lastAttackTime = 0;
 	private dodgeTimer = 0;
 	private dodgeDirection = 0;
+	grounded = false;
+	lastAIOutput: AIOutput = {
+		moveLeft: false, moveRight: false, jump: false, attack: false,
+		aimAngle: 0, evadeActive: false, switchToMelee: false, switchToRanged: true,
+	};
 
 	public get hp() {
 		return this._hp;
@@ -39,11 +42,8 @@ export default class AIEnemy extends Phaser.Physics.Arcade.Sprite {
 		frame?: string | number,
 	) {
 		super(scene, x, y, texture, frame);
-		scene.physics.add.existing(this);
 		scene.sys.displayList.add(this);
 		scene.sys.updateList.add(this);
-		this.setBounce(0.4);
-		this.setCollideWorldBounds(true);
 		this.bullets = new Bullets(scene);
 		this.bullets.setOwner("ENEMY");
 		this.brain = new EnemyBrain({ ...DEFAULT_AI_CONFIG, ...config });
@@ -91,9 +91,9 @@ export default class AIEnemy extends Phaser.Physics.Arcade.Sprite {
 		playerFacingDirection: number,
 		hasLineOfSight = true,
 		playerHP = 100,
+		wallTouch: "none" | "left" | "right" = "none",
 	) {
 		if (this._hp <= 0) {
-			this.setVelocity(0, 0);
 			this.anims.play("turn");
 			return;
 		}
@@ -112,63 +112,48 @@ export default class AIEnemy extends Phaser.Physics.Arcade.Sprite {
 			selfY: this.y,
 			distanceToPlayer: distance,
 			playerFacingDirection,
-			touchingDown: this.body?.touching.down ?? false,
-			touchingLeft: this.body?.touching.left ?? false,
-			touchingRight: this.body?.touching.right ?? false,
+			touchingDown: this.grounded,
+			touchingLeft: wallTouch === "left",
+			touchingRight: wallTouch === "right",
 			hasLineOfSight,
 			selfHP: this._hp,
 			enemyHP: playerHP,
 		};
 
 		if (this.dodgeTimer > 0) {
-			this.setVelocityX(this.dodgeDirection * 300);
 			this.lastFacingDirection = this.dodgeDirection;
 			this.anims.play(this.dodgeDirection < 0 ? "left" : "right", true);
 			return;
 		}
 
 		const output = this.brain.decide(input, time, delta);
+		this.lastAIOutput = output;
 
 		if (output.evadeActive) {
 			this.dodgeTimer = 200 + Math.random() * 100;
 			this.dodgeDirection = output.moveLeft ? -1 : 1;
 			this.lastFacingDirection = this.dodgeDirection;
-			this.setVelocityX(this.dodgeDirection * 300);
 			this.anims.play(this.dodgeDirection < 0 ? "left" : "right", true);
-			if (output.jump && this.body?.touching.down) {
-				this.setVelocityY(-330);
-			}
 			return;
 		}
 
 		if (output.moveLeft && !output.moveRight) {
-			this.setVelocityX(-160);
 			this.lastFacingDirection = -1;
 			this.anims.play("left", true);
 		} else if (output.moveRight && !output.moveLeft) {
-			this.setVelocityX(160);
 			this.lastFacingDirection = 1;
 			this.anims.play("right", true);
 		} else {
-			if (this.body?.touching.down) this.anims.play("turn");
-			this.setVelocityX(0);
+			if (this.grounded) this.anims.play("turn");
 		}
 
-		if (output.jump && this.body?.touching.down) {
-			this.setVelocityY(-330);
-		} else if (output.jump && this.body?.touching.left) {
-			this.setVelocity(100, -330);
-		} else if (output.jump && this.body?.touching.right) {
-			this.setVelocity(-100, -330);
-		}
-
-		if (output.attack && time - this.lastAttackTime > this.attackCooldown) {
+		if (output.attack && time - this.lastAttackTime > 250) {
 			this.lastAttackTime = time;
 			const isMelee = distance < 100;
 			if (isMelee) {
 				this.meleeAttack();
 			} else {
-				this.bullets.fireBullet(this.body!.x, this.body!.y, output.aimAngle);
+				this.bullets.fireBullet(this.x, this.y, output.aimAngle);
 			}
 		}
 	}
