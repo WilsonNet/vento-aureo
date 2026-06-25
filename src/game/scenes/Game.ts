@@ -20,6 +20,7 @@ import {
 	bulletHitsPlatform,
 	bulletHitsPlayer,
 	BULLET_DAMAGE,
+	GRAVITY,
 	platforms as sharedPlatforms,
 	type PlayerPosition,
 	type BulletState,
@@ -30,12 +31,47 @@ import {
 	WORLD_BOTTOM,
 	ATTACK_COOLDOWN,
 } from "../simulation/Physics";
-import type { BulletData } from "../skills/Bullets";
-import { MovementState, ActionState } from "../characters/playerStates";
+import { MovementState } from "../characters/playerStates";
 
 interface LocalBullet extends BulletState {
 	active: boolean;
 	sprite: Phaser.GameObjects.Sprite;
+}
+
+interface DiagnosticFrame {
+	playerX: number;
+	playerY: number;
+	playerVx: number;
+	playerVy: number;
+	enemyX: number;
+	enemyY: number;
+	enemyVx: number;
+	enemyVy: number;
+	cameraX: number;
+	cameraY: number;
+	t: number;
+	dt: number;
+	physicsSteps: number;
+}
+
+interface JitterEvent {
+	frame: number;
+	type: string;
+	delta: number;
+	expectedMax: number;
+	severity: number;
+}
+
+const PHYSICS_DT = 1 / 60;
+const MAX_PHYSICS_STEPS = 5;
+
+const DIAG_JITTER_X = 35;
+const DIAG_JITTER_Y = 25;
+const DIAG_JITTER_CAM = 15;
+
+function friLerp(current: number, target: number, factor: number, dtSec: number): number {
+	const t = 1 - Math.pow(1 - factor, dtSec * 60);
+	return current + (target - current) * t;
 }
 
 export default class Game extends Phaser.Scene {
@@ -70,11 +106,28 @@ export default class Game extends Phaser.Scene {
 	private onlineBulletSprites: Phaser.GameObjects.Sprite[] = [];
 	private onlineInitialized = false;
 
+	private physicsAccumulator = 0;
+	private cachedPlayerInput = { left: false, right: false, up: false };
+	private cachedEnemyInput = { left: false, right: false, up: false };
+	private cachedAimAngle = 0;
+	private enemyEvadeActive = false;
+	private enemyEvadeDir = 1;
+	private cachedPlayerAttack = false;
+
+	private _diagActive = false;
+	private _diagStartTime = 0;
+	private _diagDuration = 0;
+	private _diagFrames: DiagnosticFrame[] = [];
+	private _diagPrev: { px: number; py: number; ex: number; ey: number; cx: number; cy: number } = { px: 0, py: 0, ex: 0, ey: 0, cx: 0, cy: 0 };
+	private _diagFrameCount = 0;
+	private _diagJitter: JitterEvent[] = [];
+	private _diagRecon: { frame: number; serverX: number; clientX: number; serverY: number; clientY: number; correction: number }[] = [];
+	private _diagSkipJitter = false;
+	private _diagPhysicsSteps = 0;
+
 	constructor() {
 		super("Game");
 	}
-
-	preload() {}
 
 	create() {
 		const camera = this.cameras.main;
@@ -155,6 +208,7 @@ export default class Game extends Phaser.Scene {
 			playerState: this.playerBrain?.getCurrentState(),
 			enemyState: this.aiEnemy?.getCurrentAIState(),
 		});
+		win.__physicsDiagnostic = (durationMs = 5000) => this.startDiagnostic(durationMs);
 
 		EventBus.emit("current-scene-ready", this);
 
@@ -211,9 +265,27 @@ export default class Game extends Phaser.Scene {
 				this.player.hp = p.hp;
 				this.hpText?.setText(`hp: ${Math.max(0, p.hp)}`);
 
-				this.playerPhys.x += (p.x - this.playerPhys.x) * 0.15;
-				this.playerPhys.y += (p.y - this.playerPhys.y) * 0.15;
+				const errX = p.x - this.playerPhys.x;
+				const errY = p.y - this.playerPhys.y;
+				if (Math.abs(errX) > 100 || Math.abs(errY) > 100) {
+					this.playerPhys.x = p.x;
+					this.playerPhys.y = p.y;
+				} else {
+					this.playerPhys.x += errX * 0.15;
+					this.playerPhys.y += errY * 0.15;
+				}
 				this.player.setPosition(this.playerPhys.x, this.playerPhys.y);
+
+				if (this._diagActive) {
+					this._diagRecon.push({
+						frame: this._diagFrameCount,
+						serverX: p.x,
+						clientX: this.playerPhys.x,
+						serverY: p.y,
+						clientY: this.playerPhys.y,
+						correction: Math.sqrt(errX * errX + errY * errY),
+					});
+				}
 
 				if (p.hp <= 0) {
 					this.player.setAlpha(0.3);
@@ -272,6 +344,7 @@ export default class Game extends Phaser.Scene {
 
 	private resetFight() {
 		if (!this.player || !this.aiEnemy) return;
+		this._diagSkipJitter = true;
 
 		if (this.aiVsAIMode) {
 			const playerConfig = this.generateFightConfig();
@@ -394,34 +467,68 @@ export default class Game extends Phaser.Scene {
 		return true;
 	}
 
+	// =============================================
+	//  UPDATE LOOP
+	// =============================================
+
 	update(t: number, dt: number) {
+		const dtSec = Math.min(dt / 1000, 0.05);
+
 		if (this.onlineMode) {
-			this.updateOnline(t, dt);
-			return;
-		}
-
-		const dtSec = dt / 1000;
-
-		if (this.aiVsAIMode && this.player && this.playerBrain && this.aiEnemy) {
-			this.updateAIVsAI(t, dtSec);
+			this.updateOnline(t, dt, dtSec);
 		} else {
-			this.updateLocalPlayer(dtSec);
+			this.updateOffline(t, dtSec);
 		}
 
-		this.updateAISimulation(t, dtSec);
-
-		this.updateBullets(dtSec);
-
-		this.cameras.main.centerOn(
-			this.playerPhys.x + PLAYER_WIDTH / 2,
-			this.playerPhys.y + PLAYER_HEIGHT / 2,
-		);
+		if (this._diagActive) {
+			this.recordDiagnosticFrame(t, dt);
+		}
 	}
 
-	private updateLocalPlayer(dtSec: number) {
+	// =============================================
+	//  OFFLINE MODE  (player vs AI)
+	// =============================================
+
+	private updateOffline(t: number, dtSec: number) {
+		const now = this.game.loop.time;
+
+		this.gatherInputs(t, dtSec, now);
+
+		this._diagPhysicsSteps = 0;
+		this.physicsAccumulator += dtSec;
+		let steps = 0;
+		while (this.physicsAccumulator >= PHYSICS_DT && steps < MAX_PHYSICS_STEPS) {
+			this.fixedPhysicsStep(PHYSICS_DT);
+			this.physicsAccumulator -= PHYSICS_DT;
+			steps++;
+		}
+		if (this._diagActive) this._diagPhysicsSteps = steps;
+
+		this.applyPositions();
+
+		this.handleAttacks(now);
+
+		this.updateCamera(dtSec);
+	}
+
+	private gatherInputs(t: number, dtSec: number, now: number) {
 		if (!this.player || !this.cursors) return;
 
-		this.player.update(this.game.loop.time, dtSec * 1000, this.cursors);
+		const isAIVsAI = this.aiVsAIMode && this.playerBrain && this.aiEnemy;
+
+		if (isAIVsAI) {
+			this.gatherAIInputs(t, dtSec);
+		} else {
+			this.gatherPlayerInput(t, now);
+		}
+
+		this.gatherEnemyInput(t, dtSec);
+	}
+
+	private gatherPlayerInput(t: number, now: number) {
+		if (!this.player || !this.cursors) return;
+
+		this.player.update(t, 16, this.cursors);
 
 		let input = {
 			left: this.cursors.left?.isDown ?? false,
@@ -437,22 +544,53 @@ export default class Game extends Phaser.Scene {
 			input = { left: false, right: false, up: false };
 		}
 
-		this.playerPhys = tickPlayer(this.playerPhys, input, dtSec);
-		this.player.setPosition(this.playerPhys.x, this.playerPhys.y);
-		this.player.grounded = this.playerPhys.grounded;
-
-		if (this.input.activePointer.isDown) {
-			const now = this.game.loop.time;
-			if (canFire(this.player.lastAttackTime, now)) {
-				this.player.lastAttackTime = now;
-				const bx = this.playerPhys.x + PLAYER_WIDTH / 2;
-				const by = this.playerPhys.y + PLAYER_HEIGHT / 2;
-				this.fireLocalBullet(bx, by, this.player.getMouseAngle(), "player");
-			}
-		}
+		this.cachedPlayerInput = input;
+		this.cachedAimAngle = this.player.getMouseAngle();
 	}
 
-	private updateAISimulation(t: number, dtSec: number) {
+	private gatherAIInputs(t: number, dtSec: number) {
+		if (!this.player || !this.playerBrain || !this.aiEnemy) return;
+
+		const enemy = this.aiEnemy;
+		const player = this.player;
+
+		if (player.hp <= 0) return;
+
+		const dx = enemy.x - player.x;
+		const dy = enemy.y - player.y;
+		const distance = Math.sqrt(dx * dx + dy * dy);
+
+		const los = this.hasLineOfSight(player.x, player.y, enemy.x, enemy.y);
+
+		const pInput = {
+			playerX: enemy.x,
+			playerY: enemy.y,
+			selfX: player.x,
+			selfY: player.y,
+			distanceToPlayer: distance,
+			playerFacingDirection: enemy.getFacingDirection(),
+			touchingDown: this.playerPhys.grounded,
+			touchingLeft: this.playerPhys.wallTouch === "left",
+			touchingRight: this.playerPhys.wallTouch === "right",
+			hasLineOfSight: los,
+			selfHP: player.hp,
+			enemyHP: enemy.hp,
+		};
+
+		const output = this.playerBrain.decide(pInput, t, dtSec * 1000);
+		player.setAIOverride(output);
+
+		this.cachedPlayerInput = {
+			left: output.moveLeft,
+			right: output.moveRight,
+			up: output.jump,
+		};
+		this.cachedAimAngle = output.aimAngle;
+		this.cachedPlayerAttack = output.attack;
+		this.playerPhys.vx = 0;
+	}
+
+	private gatherEnemyInput(t: number, dtSec: number) {
 		if (!this.aiEnemy || !this.player) return;
 		if (this.aiEnemy.hp <= 0) return;
 
@@ -476,35 +614,127 @@ export default class Game extends Phaser.Scene {
 
 		const output = this.aiEnemy.lastAIOutput;
 
-		if (output.evadeActive) {
-			const dir = output.moveLeft ? -1 : 1;
-			this.enemyPhys.vx = dir * 300;
-			this.enemyPhys.vy += 300 * dtSec;
-			this.enemyPhys.x += this.enemyPhys.vx * dtSec;
-			this.enemyPhys.y += this.enemyPhys.vy * dtSec;
-			this.applyWorldBounds(this.enemyPhys);
-			this.applyPlatformCollision(this.enemyPhys, dtSec);
-		} else {
-			this.enemyPhys = tickPlayer(this.enemyPhys, {
-				left: output.moveLeft,
-				right: output.moveRight,
-				up: output.jump,
-			}, dtSec);
+		this.cachedEnemyInput = {
+			left: output.moveLeft,
+			right: output.moveRight,
+			up: output.jump,
+		};
+		this.enemyEvadeActive = output.evadeActive;
+		this.enemyEvadeDir = output.moveLeft ? -1 : 1;
+	}
+
+	private fixedPhysicsStep(dt: number) {
+		this.playerPhys = tickPlayer(this.playerPhys, this.cachedPlayerInput, dt);
+
+		if (this.aiEnemy && this.aiEnemy.hp > 0) {
+			if (this.enemyEvadeActive) {
+				const dir = this.enemyEvadeDir;
+				this.enemyPhys.vx = dir * 300;
+				this.enemyPhys.vy += GRAVITY * dt;
+				this.enemyPhys.x += this.enemyPhys.vx * dt;
+				this.enemyPhys.y += this.enemyPhys.vy * dt;
+				this.applyWorldBounds(this.enemyPhys);
+				this.applyPlatformCollision(this.enemyPhys, dt);
+			} else {
+				this.enemyPhys = tickPlayer(this.enemyPhys, this.cachedEnemyInput, dt);
+			}
 		}
 
-		this.aiEnemy.setPosition(this.enemyPhys.x, this.enemyPhys.y);
-		this.aiEnemy.grounded = this.enemyPhys.grounded;
-		this.aiEnemy.lastFacingDirection = output.moveLeft ? -1 : output.moveRight ? 1 : this.aiEnemy.lastFacingDirection;
+		for (const b of this.localBulletData) {
+			if (b.active) {
+				tickBullet(b, dt);
+			}
+		}
+	}
 
-		const now = this.game.loop.time;
-		if (output.attack && canFire(this.aiEnemy.lastAttackTime, now)) {
-			this.aiEnemy.lastAttackTime = now;
-			this.fireLocalBullet(
-				this.enemyPhys.x + PLAYER_WIDTH / 2,
-				this.enemyPhys.y + PLAYER_HEIGHT / 2,
-				output.aimAngle,
-				"enemy",
-			);
+	private applyPositions() {
+		if (this.player) {
+			this.player.setPosition(this.playerPhys.x, this.playerPhys.y);
+			this.player.grounded = this.playerPhys.grounded;
+		}
+		if (this.aiEnemy && this.aiEnemy.hp > 0) {
+			this.aiEnemy.setPosition(this.enemyPhys.x, this.enemyPhys.y);
+			this.aiEnemy.grounded = this.enemyPhys.grounded;
+
+			const output = this.aiEnemy.lastAIOutput;
+			this.aiEnemy.lastFacingDirection = output.moveLeft ? -1 : output.moveRight ? 1 : this.aiEnemy.lastFacingDirection;
+		}
+	}
+
+	private handleAttacks(now: number) {
+		if (!this.player || !this.aiEnemy) return;
+
+		if (!this.aiVsAIMode && this.input.activePointer.isDown) {
+			if (canFire(this.player.lastAttackTime, now)) {
+				this.player.lastAttackTime = now;
+				const bx = this.playerPhys.x + PLAYER_WIDTH / 2;
+				const by = this.playerPhys.y + PLAYER_HEIGHT / 2;
+				this.fireLocalBullet(bx, by, this.cachedAimAngle, "player");
+			}
+		}
+
+		if (this.aiEnemy && this.aiEnemy.hp > 0) {
+			const output = this.aiEnemy.lastAIOutput;
+			if (output.attack && canFire(this.aiEnemy.lastAttackTime, now)) {
+				this.aiEnemy.lastAttackTime = now;
+				this.fireLocalBullet(
+					this.enemyPhys.x + PLAYER_WIDTH / 2,
+					this.enemyPhys.y + PLAYER_HEIGHT / 2,
+					output.aimAngle,
+					"enemy",
+				);
+			}
+		}
+
+		if (this.aiVsAIMode && this.player && this.playerBrain && this.aiEnemy) {
+			if (this.cachedPlayerAttack && canFire(this.player.lastAttackTime, now)) {
+				this.player.lastAttackTime = now;
+				this.fireLocalBullet(
+					this.playerPhys.x + PLAYER_WIDTH / 2,
+					this.playerPhys.y + PLAYER_HEIGHT / 2,
+					this.cachedAimAngle,
+					"player",
+				);
+			}
+		}
+
+		this.updateBulletCollisions();
+	}
+
+	private updateBulletCollisions() {
+		for (let i = this.localBulletData.length - 1; i >= 0; i--) {
+			const b = this.localBulletData[i];
+			if (!b.active) {
+				b.sprite.setVisible(false);
+				this.localBulletData.splice(i, 1);
+				continue;
+			}
+
+			if (isBulletOutOfBounds(b) || bulletHitsPlatform(b)) {
+				b.sprite.setVisible(false);
+				this.localBulletData.splice(i, 1);
+				continue;
+			}
+
+			if (b.ownerId === "player" && this.aiEnemy && this.aiEnemy.hp > 0) {
+				if (bulletHitsPlayer(b, this.enemyPhys.x, this.enemyPhys.y)) {
+					this.onPlayerBulletHitEnemy(b);
+					b.sprite.setVisible(false);
+					this.localBulletData.splice(i, 1);
+					continue;
+				}
+			}
+
+			if (b.ownerId === "enemy" && this.player && this.player.hp > 0) {
+				if (bulletHitsPlayer(b, this.playerPhys.x, this.playerPhys.y)) {
+					this.onEnemyBulletHitPlayer(b);
+					b.sprite.setVisible(false);
+					this.localBulletData.splice(i, 1);
+					continue;
+				}
+			}
+
+			b.sprite.setPosition(b.x, b.y);
 		}
 	}
 
@@ -560,57 +790,24 @@ export default class Game extends Phaser.Scene {
 		EventBus.emit("bullet-fired");
 	}
 
-	private updateBullets(dtSec: number) {
-		for (let i = this.localBulletData.length - 1; i >= 0; i--) {
-			const b = this.localBulletData[i];
-			if (!b.active) {
-				b.sprite.setVisible(false);
-				this.localBulletData.splice(i, 1);
-				continue;
-			}
-
-			tickBullet(b, dtSec);
-
-			if (isBulletOutOfBounds(b) || bulletHitsPlatform(b)) {
-				b.sprite.setVisible(false);
-				this.localBulletData.splice(i, 1);
-				continue;
-			}
-
-			if (b.ownerId === "player" && this.aiEnemy && this.aiEnemy.hp > 0) {
-				if (bulletHitsPlayer(b, this.enemyPhys.x, this.enemyPhys.y)) {
-					this.onPlayerBulletHitEnemy(b);
-					b.sprite.setVisible(false);
-					this.localBulletData.splice(i, 1);
-					continue;
-				}
-			}
-
-			if (b.ownerId === "enemy" && this.player && this.player.hp > 0) {
-				if (bulletHitsPlayer(b, this.playerPhys.x, this.playerPhys.y)) {
-					this.onEnemyBulletHitPlayer(b);
-					b.sprite.setVisible(false);
-					this.localBulletData.splice(i, 1);
-					continue;
-				}
-			}
-
-			b.sprite.setPosition(b.x, b.y);
-		}
-	}
-
-	private logAIVsAIState() {
-		if (!this.aiVsAIMode || !this.player || !this.aiEnemy) return;
-		console.log(
-			`[STATE] Player: ${this.playerBrain?.getCurrentState()} | Enemy: ${this.aiEnemy.getCurrentAIState()} | HP ${this.player.hp} vs ${this.aiEnemy.hp}`,
+	private updateCamera(dtSec: number) {
+		const targetX = this.playerPhys.x + PLAYER_WIDTH / 2;
+		const targetY = this.playerPhys.y + PLAYER_HEIGHT / 2;
+		this.cameras.main.centerOn(
+			targetX,
+			targetY,
 		);
 	}
 
-	updateOnline(t: number, dt: number) {
+	// =============================================
+	//  ONLINE MODE
+	// =============================================
+
+	updateOnline(t: number, dt: number, dtSec: number) {
 		if (!this.player || !this.onlineManager?.connected) return;
 
 		if (this.onlineAIMode && this.playerBrain && this.remoteSprite) {
-			this.updateOnlineAI(t, dt);
+			this.updateOnlineAI(t, dt, dtSec);
 			return;
 		}
 
@@ -622,8 +819,18 @@ export default class Game extends Phaser.Scene {
 
 		this.onlineManager.sendInput({ left, right, up, attack, aimAngle });
 
-		const dtSec = dt / 1000;
-		this.playerPhys = tickPlayer(this.playerPhys, { left, right, up }, dtSec);
+		this.cachedPlayerInput = { left, right, up };
+
+		this._diagPhysicsSteps = 0;
+		this.physicsAccumulator += dtSec;
+		let steps = 0;
+		while (this.physicsAccumulator >= PHYSICS_DT && steps < MAX_PHYSICS_STEPS) {
+			this.playerPhys = tickPlayer(this.playerPhys, this.cachedPlayerInput, PHYSICS_DT);
+			this.physicsAccumulator -= PHYSICS_DT;
+			steps++;
+		}
+		if (this._diagActive) this._diagPhysicsSteps = steps;
+
 		this.player.setPosition(this.playerPhys.x, this.playerPhys.y);
 		this.player.grounded = this.playerPhys.grounded;
 
@@ -637,20 +844,16 @@ export default class Game extends Phaser.Scene {
 
 		this.updateRemoteInterpolation(dtSec);
 
-		this.cameras.main.centerOn(
-			this.playerPhys.x + PLAYER_WIDTH / 2,
-			this.playerPhys.y + PLAYER_HEIGHT / 2,
-		);
+		this.updateCamera(dtSec);
 	}
 
 	private updateRemoteInterpolation(dtSec: number) {
 		if (!this.remoteSprite) return;
-		const lerpSpeed = 12;
-		this.remoteSprite.x += (this.remoteTargetX - this.remoteSprite.x) * lerpSpeed * dtSec;
-		this.remoteSprite.y += (this.remoteTargetY - this.remoteSprite.y) * lerpSpeed * dtSec;
+		this.remoteSprite.x = friLerp(this.remoteSprite.x, this.remoteTargetX, 0.8, dtSec);
+		this.remoteSprite.y = friLerp(this.remoteSprite.y, this.remoteTargetY, 0.8, dtSec);
 	}
 
-	private updateOnlineAI(t: number, dt: number) {
+	private updateOnlineAI(t: number, dt: number, dtSec: number) {
 		if (!this.player || !this.playerBrain || !this.remoteSprite || !this.onlineManager) return;
 		const brain = this.playerBrain;
 		const enemyX = this.remoteSprite.x;
@@ -686,71 +889,228 @@ export default class Game extends Phaser.Scene {
 			aimAngle: output.aimAngle,
 		});
 
-		const dtSec = dt / 1000;
-		this.playerPhys = tickPlayer(this.playerPhys, {
+		this.cachedPlayerInput = {
 			left: output.moveLeft,
 			right: output.moveRight,
 			up: output.jump,
-		}, dtSec);
+		};
+
+		this._diagPhysicsSteps = 0;
+		this.physicsAccumulator += dtSec;
+		let steps = 0;
+		while (this.physicsAccumulator >= PHYSICS_DT && steps < MAX_PHYSICS_STEPS) {
+			this.playerPhys = tickPlayer(this.playerPhys, this.cachedPlayerInput, PHYSICS_DT);
+			this.physicsAccumulator -= PHYSICS_DT;
+			steps++;
+		}
+		if (this._diagActive) this._diagPhysicsSteps = steps;
+
 		this.player.setPosition(this.playerPhys.x, this.playerPhys.y);
 		this.player.grounded = this.playerPhys.grounded;
 
 		this.updateRemoteInterpolation(dtSec);
 
-		this.cameras.main.centerOn(
-			this.playerPhys.x + PLAYER_WIDTH / 2,
-			this.playerPhys.y + PLAYER_HEIGHT / 2,
-		);
+		this.updateCamera(dtSec);
 	}
 
-	private updateAIVsAI(t: number, dtSec: number) {
-		const player = this.player!;
-		const enemy = this.aiEnemy!;
-		const brain = this.playerBrain!;
+	// =============================================
+	//  DIAGNOSTIC TOOL
+	// =============================================
 
-		if (player.hp <= 0) return;
+	private startDiagnostic(durationMs: number): string {
+		if (this._diagActive) {
+			return "DIAGNOSTIC_ALREADY_RUNNING";
+		}
 
-		const dx = enemy.x - player.x;
-		const dy = enemy.y - player.y;
-		const distance = Math.sqrt(dx * dx + dy * dy);
+		this._diagActive = true;
+		this._diagStartTime = performance.now();
+		this._diagDuration = durationMs;
+		this._diagFrames = [];
+		this._diagPrev = {
+			px: this.playerPhys.x,
+			py: this.playerPhys.y,
+			ex: this.enemyPhys.x,
+			ey: this.enemyPhys.y,
+			cx: this.cameras.main.scrollX,
+			cy: this.cameras.main.scrollY,
+		};
+		this._diagFrameCount = 0;
+		this._diagJitter = [];
+		this._diagRecon = [];
 
-		const los = this.hasLineOfSight(player.x, player.y, enemy.x, enemy.y);
+		setTimeout(() => {
+			const report = this.finishDiagnostic();
+			console.log("__DIAGNOSTIC_RESULT__" + JSON.stringify(report) + "__END__");
+		}, durationMs);
 
-		const pInput = {
-			playerX: enemy.x,
-			playerY: enemy.y,
-			selfX: player.x,
-			selfY: player.y,
-			distanceToPlayer: distance,
-			playerFacingDirection: enemy.getFacingDirection(),
-			touchingDown: this.playerPhys.grounded,
-			touchingLeft: this.playerPhys.wallTouch === "left",
-			touchingRight: this.playerPhys.wallTouch === "right",
-			hasLineOfSight: los,
-			selfHP: player.hp,
-			enemyHP: enemy.hp,
+		return `DIAGNOSTIC_STARTED: ${durationMs}ms`;
+	}
+
+	private finishDiagnostic(): object {
+		this._diagActive = false;
+
+		const frames = this._diagFrames;
+		const totalFrames = frames.length;
+		if (totalFrames === 0) {
+			return { error: "no_frames_collected" };
+		}
+
+		const dtValues = frames.map((f) => f.dt);
+		const dtSum = dtValues.reduce((a, b) => a + b, 0);
+		const dtMean = dtSum / dtValues.length;
+		const dtVariance = dtValues.reduce((sum, d) => sum + (d - dtMean) ** 2, 0) / dtValues.length;
+		const dtStdDev = Math.sqrt(dtVariance);
+		const fpsValues = dtValues.map((d) => (d > 0 ? 1000 / d : 0));
+
+		const totalDist = this.computeTotalDistance(frames);
+
+		const byType: Record<string, number> = {};
+		for (const j of this._diagJitter) {
+			byType[j.type] = (byType[j.type] || 0) + 1;
+		}
+		const sevSum = this._diagJitter.reduce((s, j) => s + j.severity, 0);
+		const sevMax = this._diagJitter.reduce((m, j) => Math.max(m, j.severity), 0);
+
+		const stepCounts = frames.map((f) => f.physicsSteps);
+		const framesWith0Steps = stepCounts.filter((s) => s === 0).length;
+		const framesWith1Step = stepCounts.filter((s) => s === 1).length;
+		const framesWith2Steps = stepCounts.filter((s) => s === 2).length;
+
+		const report = {
+			mode: this.onlineMode ? "online" : "offline",
+			durationMs: this._diagDuration,
+			totalFrames,
+			fpsStats: {
+				minFps: Math.round(Math.min(...fpsValues)),
+				maxFps: Math.round(Math.max(...fpsValues)),
+				avgFps: Math.round(1000 / dtMean),
+				avgDtMs: Math.round(dtMean * 100) / 100,
+				dtStdDevMs: Math.round(dtStdDev * 100) / 100,
+			},
+			physicsStepDistribution: {
+				zeroStepFrames: framesWith0Steps,
+				oneStepFrames: framesWith1Step,
+				twoStepFrames: framesWith2Steps,
+				pctZeroStep: totalFrames > 0 ? Math.round(framesWith0Steps / totalFrames * 100) : 0,
+			},
+			playerMovement: {
+				xRange: [
+					Math.round(Math.min(...frames.map((f) => f.playerX))),
+					Math.round(Math.max(...frames.map((f) => f.playerX))),
+				],
+				yRange: [
+					Math.round(Math.min(...frames.map((f) => f.playerY))),
+					Math.round(Math.max(...frames.map((f) => f.playerY))),
+				],
+				totalTravelPx: Math.round(totalDist),
+			},
+			jitterEvents: this._diagJitter,
+			jitterSummary: {
+				total: this._diagJitter.length,
+				avgSeverity: this._diagJitter.length > 0 ? Math.round(sevSum / this._diagJitter.length * 100) / 100 : 0,
+				maxSeverity: Math.round(sevMax * 100) / 100,
+				byType,
+			},
+			reconciliationEvents: this._diagRecon.length > 0 ? this._diagRecon : undefined,
+			reconciliationSummary: this._diagRecon.length > 0 ? this.computeReconSummary() : undefined,
+			verdict: this._diagJitter.length === 0 ? "PASS: No jitter detected" : `FAIL: ${this._diagJitter.length} jitter events detected`,
 		};
 
-		const output = brain.decide(pInput, t, dtSec * 1000);
-		player.setAIOverride(output);
+		return report;
+	}
 
-		this.playerPhys = tickPlayer(this.playerPhys, {
-			left: output.moveLeft,
-			right: output.moveRight,
-			up: output.jump,
-		}, dtSec);
-		player.setPosition(this.playerPhys.x, this.playerPhys.y);
-		player.grounded = this.playerPhys.grounded;
-
-		const now = this.game.loop.time;
-		if (output.attack && canFire(player.lastAttackTime, now)) {
-			player.lastAttackTime = now;
-			this.fireLocalBullet(
-				this.playerPhys.x + PLAYER_WIDTH / 2,
-				this.playerPhys.y + PLAYER_HEIGHT / 2,
-				output.aimAngle,
-				"player",
-			);
+	private computeTotalDistance(frames: DiagnosticFrame[]): number {
+		let dist = 0;
+		for (let i = 1; i < frames.length; i++) {
+			const dx = frames[i].playerX - frames[i - 1].playerX;
+			const dy = frames[i].playerY - frames[i - 1].playerY;
+			dist += Math.sqrt(dx * dx + dy * dy);
 		}
+		return dist;
+	}
+
+	private computeReconSummary() {
+		if (this._diagRecon.length === 0) return undefined;
+		const corrections = this._diagRecon.map((r) => r.correction);
+		return {
+			totalCorrections: this._diagRecon.length,
+			avgErrorPx: Math.round(corrections.reduce((a, b) => a + b, 0) / corrections.length * 100) / 100,
+			maxErrorPx: Math.round(Math.max(...corrections) * 100) / 100,
+			cumulativeDriftPx: Math.round(corrections.reduce((a, b) => a + b, 0) * 100) / 100,
+		};
+	}
+
+	private recordDiagnosticFrame(t: number, dt: number) {
+		if (!this._diagActive) return;
+
+		this._diagFrameCount++;
+
+		const frame: DiagnosticFrame = {
+			playerX: this.playerPhys.x,
+			playerY: this.playerPhys.y,
+			playerVx: this.playerPhys.vx,
+			playerVy: this.playerPhys.vy,
+			enemyX: this.enemyPhys.x,
+			enemyY: this.enemyPhys.y,
+			enemyVx: this.enemyPhys.vx,
+			enemyVy: this.enemyPhys.vy,
+			cameraX: this.cameras.main.scrollX,
+			cameraY: this.cameras.main.scrollY,
+			t,
+			dt,
+			physicsSteps: this._diagPhysicsSteps,
+		};
+		this._diagFrames.push(frame);
+
+		if (this._diagSkipJitter) {
+			this._diagSkipJitter = false;
+			this._diagPrev = {
+				px: frame.playerX,
+				py: frame.playerY,
+				ex: frame.enemyX,
+				ey: frame.enemyY,
+				cx: frame.cameraX,
+				cy: frame.cameraY,
+			};
+			return;
+		}
+
+		const prev = this._diagPrev;
+
+		const checkJitter = (label: string, current: number, prev: number, threshold: number) => {
+			const delta = Math.abs(current - prev);
+			if (delta > threshold) {
+				this._diagJitter.push({
+					frame: this._diagFrameCount,
+					type: label,
+					delta: Math.round(delta * 100) / 100,
+					expectedMax: threshold,
+					severity: Math.round(delta / threshold * 100) / 100,
+				});
+			}
+		};
+
+		checkJitter("player_x", frame.playerX, prev.px, DIAG_JITTER_X);
+		checkJitter("player_y", frame.playerY, prev.py, DIAG_JITTER_Y);
+		checkJitter("enemy_x", frame.enemyX, prev.ex, DIAG_JITTER_X);
+		checkJitter("enemy_y", frame.enemyY, prev.ey, DIAG_JITTER_Y);
+		checkJitter("camera_x", frame.cameraX, prev.cx, DIAG_JITTER_CAM);
+		checkJitter("camera_y", frame.cameraY, prev.cy, DIAG_JITTER_CAM);
+
+		this._diagPrev = {
+			px: frame.playerX,
+			py: frame.playerY,
+			ex: frame.enemyX,
+			ey: frame.enemyY,
+			cx: frame.cameraX,
+			cy: frame.cameraY,
+		};
+	}
+
+	private logAIVsAIState() {
+		if (!this.aiVsAIMode || !this.player || !this.aiEnemy) return;
+		console.log(
+			`[STATE] Player: ${this.playerBrain?.getCurrentState()} | Enemy: ${this.aiEnemy.getCurrentAIState()} | HP ${this.player.hp} vs ${this.aiEnemy.hp}`,
+		);
 	}
 }
